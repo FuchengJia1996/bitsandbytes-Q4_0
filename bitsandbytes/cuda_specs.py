@@ -22,8 +22,9 @@ def get_compute_capabilities() -> List[Tuple[int, int]]:
 def get_cuda_version_tuple() -> Tuple[int, int]:
     # https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART____VERSION.html#group__CUDART____VERSION
     major, minor = map(int, torch.version.cuda.split("."))
-    return major, minor
+    #return major, minor
     #return 12, 4
+    return 11, 3
 
 
 def get_cuda_version_string() -> str:
