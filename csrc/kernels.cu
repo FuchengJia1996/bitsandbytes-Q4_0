@@ -22,6 +22,7 @@
 #define NUM 4
 #define NUM_BLOCK 4096
 
+#define USE_Q4_0
 
 // source: https://stackoverflow.com/questions/17399119/how-do-i-use-atomicmax-on-floating-point-values-in-cuda
 __device__ float atomicMax(float* address, float val) {
@@ -117,6 +118,12 @@ __device__ float dDequantizeFP4Tree(unsigned char val, float absmax)
         return 0.00000000f*absmax*sign; // 1000
 }
 
+__device__ float dDequantizeQ40(unsigned char val, float absmax)
+{
+  int x = val-8;
+  return x*absmax;
+}
+
 __device__ unsigned char dQuantizeFP4(float x)
 {
   // FP4 with bias of 3
@@ -164,6 +171,11 @@ __device__ unsigned char dQuantizeFP4(float x)
         return 0b0001+sign;
       else
         return 0b0000+sign;
+}
+
+__device__ unsigned char dQuantizeQ40(float x)
+{
+  return (unsigned char) min(15.0f, x + 8.5f);
 }
 
 __device__ half dhDequantizeNF4(unsigned char val)
@@ -731,13 +743,13 @@ __global__ void kQuantizeBlockwise(float * code, T * __restrict__ const A, float
 
   T vals[NUM_PER_TH];
   float rand_vals[NUM_PER_TH];
-  unsigned char qvals[(DATA_TYPE > 0) ? NUM_PER_TH/2 : NUM_PER_TH];
+  unsigned char qvals[(DATA_TYPE > 0) ? ((NUM_PER_TH/2) ? (NUM_PER_TH/2) : 1) : NUM_PER_TH];
   //float local_abs_max = -FLT_MAX;
   float local_abs_max = 0.0f;
   int local_rand_idx = 0;
 
   typedef cub::BlockLoad<T, BLOCK_SIZE/NUM_PER_TH, NUM_PER_TH, cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadT;
-  typedef cub::BlockStore<unsigned char, BLOCK_SIZE/NUM_PER_TH, (DATA_TYPE > 0) ? NUM_PER_TH/2 : NUM_PER_TH, cub::BLOCK_STORE_WARP_TRANSPOSE> StoreChar;
+  typedef cub::BlockStore<unsigned char, BLOCK_SIZE/NUM_PER_TH, (DATA_TYPE > 0) ? ((NUM_PER_TH/2) ? (NUM_PER_TH/2) : 1) : NUM_PER_TH, cub::BLOCK_STORE_WARP_TRANSPOSE> StoreChar;
   typedef cub::BlockReduce<float, BLOCK_SIZE/NUM_PER_TH> BlockReduce;
   typedef cub::BlockLoad<float, BLOCK_SIZE/NUM_PER_TH, NUM_PER_TH, cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadFloat;
 
@@ -764,11 +776,22 @@ __global__ void kQuantizeBlockwise(float * code, T * __restrict__ const A, float
     // 2. broadcast local max
     // 3. normalize inputs and quantize
 
-    #pragma unroll NUM_PER_TH
-    for(int j = 0; j < NUM_PER_TH; j++)
-       local_abs_max = fmaxf(local_abs_max, fabsf((float)vals[j]));
+    if (NUM_PER_TH > 1)
+    {
+      #pragma unroll NUM_PER_TH
+      for(int j = 0; j < NUM_PER_TH; j++)
+        local_abs_max = fmaxf(local_abs_max, fabsf((float)vals[j]));
+    }
+    else
+    {
+      local_abs_max = fmaxf(local_abs_max, fabsf((float)vals[0]));
+    }
 
     local_abs_max = BlockReduce(reduce).Reduce(local_abs_max, cub::Max(), valid_items);
+
+#ifdef USE_Q4_0
+    local_abs_max = local_abs_max / -8;
+#endif
 
     if(threadIdx.x == 0)
       smem_absmax_value[0] = local_abs_max;
@@ -804,12 +827,33 @@ __global__ void kQuantizeBlockwise(float * code, T * __restrict__ const A, float
             }
             break;
         case FP4:
-            #pragma unroll NUM_PER_TH
-            for(int j = 0; j < NUM_PER_TH/2; j++)
+            if (NUM_PER_TH > 1)
             {
-              packed_4bit |= dQuantizeFP4(((float)vals[2*j])*local_abs_max) << 4;
-              packed_4bit |= dQuantizeFP4(((float)vals[2*j+1])*local_abs_max);
-              qvals[j] = packed_4bit;
+#ifdef USE_Q4_0
+              #pragma unroll NUM_PER_TH
+              for(int j = 0; j < NUM_PER_TH/2; j++)
+              {
+                packed_4bit |= dQuantizeQ40(((float)vals[2*j])*local_abs_max) << 4;
+                packed_4bit |= dQuantizeQ40(((float)vals[2*j+1])*local_abs_max);
+                qvals[j] = packed_4bit;
+              }
+#else
+              #pragma unroll NUM_PER_TH
+              for(int j = 0; j < NUM_PER_TH/2; j++)
+              {
+                packed_4bit |= dQuantizeFP4(((float)vals[2*j])*local_abs_max) << 4;
+                packed_4bit |= dQuantizeFP4(((float)vals[2*j+1])*local_abs_max);
+                qvals[j] = packed_4bit;
+              }
+#endif
+            }
+            else
+            {
+              if (i%2 == 0)
+                packed_4bit |= dQuantizeFP4(((float)vals[0])*local_abs_max) << 4;
+              else
+                packed_4bit |= dQuantizeFP4(((float)vals[0])*local_abs_max);
+              qvals[0] = packed_4bit;
             }
             break;
         case NF4:
@@ -873,12 +917,21 @@ __global__ void kDequantizeBlockwise(float *code, unsigned char * A, float * abs
             vals[j] = __ldg(&code[qvals[j]])*local_abs_max;
           break;
         case FP4:
+#ifdef USE_Q4_0
+          #pragma unroll NUM_PER_TH
+          for(int j = 0; j < NUM_PER_TH; j++)
+          {
+            vals[j*2] = dDequantizeQ40(qvals[j] >> 4, local_abs_max);
+            vals[j*2 + 1] = dDequantizeQ40(qvals[j] & 0x0F, local_abs_max);
+          }
+#else
           #pragma unroll NUM_PER_TH
           for(int j = 0; j < NUM_PER_TH; j++)
           {
             vals[j*2] = dDequantizeFP4Tree(qvals[j] >> 4, local_abs_max);
             vals[j*2 + 1] = dDequantizeFP4Tree(qvals[j] & 0x0F, local_abs_max);
           }
+#endif
           break;
         case NF4:
           #pragma unroll NUM_PER_TH
@@ -3974,6 +4027,7 @@ MAKE_kQuantizeBlockwise(half,   512, 2, 0, General8bit)
 MAKE_kQuantizeBlockwise(half,   256, 2, 0, General8bit)
 MAKE_kQuantizeBlockwise(half,   128, 2, 0, General8bit)
 MAKE_kQuantizeBlockwise(half,    64, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(half,    32, 1, 0, General8bit)
 MAKE_kQuantizeBlockwise(half,  4096, 4, 0, FP4)
 MAKE_kQuantizeBlockwise(half,  2048, 4, 0, FP4)
 MAKE_kQuantizeBlockwise(half,  1024, 4, 0, FP4)
@@ -3981,6 +4035,7 @@ MAKE_kQuantizeBlockwise(half,   512, 2, 0, FP4)
 MAKE_kQuantizeBlockwise(half,   256, 2, 0, FP4)
 MAKE_kQuantizeBlockwise(half,   128, 2, 0, FP4)
 MAKE_kQuantizeBlockwise(half,    64, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(half,    32, 1, 0, FP4)
 MAKE_kQuantizeBlockwise(half,  4096, 4, 0, NF4)
 MAKE_kQuantizeBlockwise(half,  2048, 4, 0, NF4)
 MAKE_kQuantizeBlockwise(half,  1024, 4, 0, NF4)
@@ -3988,6 +4043,7 @@ MAKE_kQuantizeBlockwise(half,   512, 2, 0, NF4)
 MAKE_kQuantizeBlockwise(half,   256, 2, 0, NF4)
 MAKE_kQuantizeBlockwise(half,   128, 2, 0, NF4)
 MAKE_kQuantizeBlockwise(half,    64, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(half,    32, 1, 0, NF4)
 MAKE_kQuantizeBlockwise(float, 4096, 4, 0, General8bit)
 MAKE_kQuantizeBlockwise(float, 4096, 4, 1, General8bit)
 MAKE_kQuantizeBlockwise(float, 2048, 4, 0, General8bit)
@@ -3996,6 +4052,7 @@ MAKE_kQuantizeBlockwise(float,  512, 2, 0, General8bit)
 MAKE_kQuantizeBlockwise(float,  256, 2, 0, General8bit)
 MAKE_kQuantizeBlockwise(float,  128, 2, 0, General8bit)
 MAKE_kQuantizeBlockwise(float,   64, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(float,   32, 1, 0, General8bit)
 MAKE_kQuantizeBlockwise(float, 4096, 4, 0, FP4)
 MAKE_kQuantizeBlockwise(float, 2048, 4, 0, FP4)
 MAKE_kQuantizeBlockwise(float, 1024, 4, 0, FP4)
@@ -4003,6 +4060,7 @@ MAKE_kQuantizeBlockwise(float,  512, 2, 0, FP4)
 MAKE_kQuantizeBlockwise(float,  256, 2, 0, FP4)
 MAKE_kQuantizeBlockwise(float,  128, 2, 0, FP4)
 MAKE_kQuantizeBlockwise(float,   64, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(float,   32, 1, 0, FP4)
 MAKE_kQuantizeBlockwise(float, 4096, 4, 0, NF4)
 MAKE_kQuantizeBlockwise(float, 2048, 4, 0, NF4)
 MAKE_kQuantizeBlockwise(float, 1024, 4, 0, NF4)
@@ -4010,6 +4068,7 @@ MAKE_kQuantizeBlockwise(float,  512, 2, 0, NF4)
 MAKE_kQuantizeBlockwise(float,  256, 2, 0, NF4)
 MAKE_kQuantizeBlockwise(float,  128, 2, 0, NF4)
 MAKE_kQuantizeBlockwise(float,   64, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(float,   32, 1, 0, NF4)
 
 MAKE_kQuantizeBlockwise(__nv_bfloat16, 4096, 4, 0, General8bit)
 MAKE_kQuantizeBlockwise(__nv_bfloat16, 4096, 4, 1, General8bit)
@@ -4019,6 +4078,7 @@ MAKE_kQuantizeBlockwise(__nv_bfloat16,  512, 2, 0, General8bit)
 MAKE_kQuantizeBlockwise(__nv_bfloat16,  256, 2, 0, General8bit)
 MAKE_kQuantizeBlockwise(__nv_bfloat16,  128, 2, 0, General8bit)
 MAKE_kQuantizeBlockwise(__nv_bfloat16,   64, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(__nv_bfloat16,   32, 1, 0, General8bit)
 MAKE_kQuantizeBlockwise(__nv_bfloat16, 4096, 4, 0, FP4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16, 2048, 4, 0, FP4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16, 1024, 4, 0, FP4)
@@ -4026,6 +4086,7 @@ MAKE_kQuantizeBlockwise(__nv_bfloat16,  512, 2, 0, FP4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16,  256, 2, 0, FP4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16,  128, 2, 0, FP4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16,   64, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(__nv_bfloat16,   32, 1, 0, FP4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16, 4096, 4, 0, NF4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16, 2048, 4, 0, NF4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16, 1024, 4, 0, NF4)
@@ -4033,6 +4094,7 @@ MAKE_kQuantizeBlockwise(__nv_bfloat16,  512, 2, 0, NF4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16,  256, 2, 0, NF4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16,  128, 2, 0, NF4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16,   64, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(__nv_bfloat16,   32, 1, 0, NF4)
 
 template __global__ void kDequantizeBlockwise<half, 512, 64, 8, FP4>(float *code, unsigned char * A, float * absmax, half *out, const int blocksize, const int n);
 template __global__ void kDequantizeBlockwise<half, 512, 64, 8, General8bit>(float *code, unsigned char * A, float * absmax, half *out, const int blocksize, const int n);
